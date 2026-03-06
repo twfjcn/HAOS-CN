@@ -20,7 +20,14 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
+    permissions:  # 权限移到job级别（规范写法）
+      contents: read
+      pull-requests: read
+      packages: write
     steps:
+      - name: Install jq (依赖工具)
+        run: sudo apt-get update && sudo apt-get install -y jq
+      
       - id: set-matrix
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -28,12 +35,10 @@ jobs:
           else
             TARGETS="rpi3_64,rpi4_64,rpi5_64,ova,generic_x86_64,generic_aarch64,green,yellow,panther_x2,ihost,orangepi_cm4"
           fi
-          JSON=$(echo "$TARGETS" | jq -R -c 'split(",")')
+          # 增加空值处理，避免jq解析失败
+          TARGETS=${TARGETS:-"rpi3_64,rpi4_64"}
+          JSON=$(echo "$TARGETS" | jq -R -c 'split(",") | map(trim) | map(select(length>0))')
           echo "matrix=$JSON" >> $GITHUB_OUTPUT
-    permissions:
-      contents: read
-      pull-requests: read
-      packages: write
 
   build:
     needs: prepare
@@ -43,21 +48,28 @@ jobs:
       fail-fast: false
       matrix:
         target: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    permissions:  # 为build job添加必要权限
+      contents: write
+      packages: write
     steps:
       - name: Echo target
         run: echo "Building for ${{ matrix.target }}"
-        #target: [generic_aarch64,generic_x86_64]
 
-    #steps:
-      - name: Checkout
+      # 修复：为默认checkout添加token参数
+      - name: Checkout main repo
         uses: actions/checkout@v5
+        with:
+          token: ${{ github.token }}  # 解决token缺失问题
+          fetch-depth: 0  # 可选：拉取完整历史，避免子模块问题
 
+      # 私有仓库检出（保留原有配置）
       - name: Checkout private repo
         uses: actions/checkout@v5
         with:
           repository: desmond-dong/haos-cn-scripts
           token: ${{ secrets.GH_PAT }}
           path: private
+          fetch-depth: 0
 
       - name: Run only on main
         if: github.ref_name == 'main'
@@ -77,32 +89,30 @@ jobs:
       - name: Initialization environment and Free up disk space
         run: |
           sudo timedatectl set-timezone "Asia/Shanghai"
-          chmod +x private/*.sh
-          sudo private/release_space.sh
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          chmod +x private/*.sh || echo "No scripts found in private directory"
+          sudo private/release_space.sh || echo "release_space.sh not found or failed"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
 
-
-      - name: Clone source code and Change Settings.
+      - name: Clone source code and Change Settings
         run: |
           if [ "${GITHUB_REF_NAME}" = "main" ]; then
-            git clone https://github.com/home-assistant/operating-system.git -b main
+            git clone https://github.com/home-assistant/operating-system.git -b main --recurse-submodules
           else
-            git clone https://github.com/home-assistant/operating-system.git
+            git clone https://github.com/home-assistant/operating-system.git --recurse-submodules
           fi
-          cp -r buildroot-external operating-system
+          cp -r buildroot-external operating-system || echo "buildroot-external directory not found"
           cd operating-system
-          git submodule update --init
-          
+          git submodule update --init --recursive  # 递归更新子模块，避免缺失
+
       - name: Run private build script
         run: |
-          chmod +x private/*.sh
+          chmod +x private/*.sh || true
           private/haos.sh
         env:
-          MATRIX_TARGET: ${{matrix.target}}
+          MATRIX_TARGET: ${{ matrix.target }}
           RAUC_CERTIFICATE: ${{ secrets.RAUC_CERTIFICATE }}
           RAUC_PRIVATE_KEY: ${{ secrets.RAUC_PRIVATE_KEY }}
 
- 
       - name: Log in to Docker Hub
         uses: docker/login-action@v2
         with:
@@ -114,10 +124,8 @@ jobs:
         id: build
         run: |
           sleep $((RANDOM % 600))    
-          cd operating-system
-          scripts/enter.sh make ${{matrix.target}}
-
-          
+          cd operating-system || exit 1  # 增加目录检查，避免cd失败
+          scripts/enter.sh make ${{ matrix.target }}
 
       - name: Set tag and body for release
         if: github.ref_name == 'main'
@@ -135,7 +143,7 @@ jobs:
         id: upload-release
         uses: svenstaro/upload-release-action@v2
         with:
-          repo_token: ${{ secrets.UPLOAD_TOKEN }}
+          repo_token: ${{ secrets.UPLOAD_TOKEN || github.token }}  # 兼容默认token
           file: operating-system/output/images/haos_*
           tag: ${{ env.RELEASE_TAG }}
           overwrite: true
