@@ -43,12 +43,12 @@ jobs:
       fail-fast: false
       matrix:
         target: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    permissions:
+      contents: write  # 必须添加这个权限才能上传release
     steps:
       - name: Echo target
         run: echo "Building for ${{ matrix.target }}"
-        #target: [generic_aarch64,generic_x86_64]
 
-    #steps:
       - name: Checkout
         uses: actions/checkout@v5
 
@@ -81,7 +81,6 @@ jobs:
           sudo private/release_space.sh
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
-
       - name: Clone source code and Change Settings.
         run: |
           if [ "${GITHUB_REF_NAME}" = "main" ]; then
@@ -102,7 +101,6 @@ jobs:
           RAUC_CERTIFICATE: ${{ secrets.RAUC_CERTIFICATE }}
           RAUC_PRIVATE_KEY: ${{ secrets.RAUC_PRIVATE_KEY }}
 
- 
       - name: Log in to Docker Hub
         uses: docker/login-action@v2
         with:
@@ -116,8 +114,6 @@ jobs:
           sleep $((RANDOM % 600))    
           cd operating-system
           scripts/enter.sh make ${{matrix.target}}
-
-          
 
       - name: Set tag and body for release
         if: github.ref_name == 'main'
@@ -135,7 +131,8 @@ jobs:
         id: upload-release
         uses: svenstaro/upload-release-action@v2
         with:
-          repo_token: ${{ secrets.UPLOAD_TOKEN }}
+          # 关键修复1：v2版本使用 github_token 而非 repo_token
+          github_token: ${{ secrets.UPLOAD_TOKEN }}
           file: operating-system/output/images/haos_*
           tag: ${{ env.RELEASE_TAG }}
           overwrite: true
