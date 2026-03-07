@@ -6,260 +6,139 @@ on:
         description: 'Targets to build (comma separated)'
         required: false
         default: 'rpi3_64,rpi4_64,rpi5_64,ova,generic_x86_64,generic_aarch64,green,yellow,panther_x2,ihost,orangepi_cm4'
-  push:
-    branches: [main, dev]
-    paths:
-      - '.github/workflows/Builder.yml'
-      - 'buildroot-external/**'
-      - 'private/**'
+
 #  schedule:
 #    - cron: '0 18 26 * *'
 #  watch:
 #    types: [started]
 
-env:
-  RUN_VALIDATION: false  # 关闭验证以提升编译速度
+#env:
+#  RUN_VALIDATION: true
 
 jobs:
   prepare:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TARGETS="${{ github.event.inputs.targets }}"
+          else
+            TARGETS="rpi3_64,rpi4_64,rpi5_64,ova,generic_x86_64,generic_aarch64,green,yellow,panther_x2,ihost,orangepi_cm4"
+          fi
+          JSON=$(echo "$TARGETS" | jq -R -c 'split(",")')
+          echo "matrix=$JSON" >> $GITHUB_OUTPUT
     permissions:
       contents: read
       pull-requests: read
       packages: write
-    steps:
-      - name: 升级 jq 到 1.6 版本（解决 trim 函数不支持问题）
-        run: |
-          sudo apt-get remove -y jq || true
-          wget https://github.com/jqlang/jq/releases/download/jq-1.6/jq-linux64 -O /tmp/jq
-          chmod +x /tmp/jq
-          sudo mv /tmp/jq /usr/local/bin/jq
-          jq --version
-        
-      - id: set-matrix
-        run: |
-          # 兼容手动触发、push触发、定时触发的目标参数
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TARGETS="${{ github.event.inputs.targets }}"
-          elif [ "${{ github.event_name }}" = "push" ]; then
-            # 提交触发时使用默认目标列表
-            TARGETS="rpi3_64,rpi4_64,rpi5_64,ova,generic_x86_64,generic_aarch64,green,yellow,panther_x2,ihost,orangepi_cm4"
-          else
-            TARGETS="rpi3_64,rpi4_64"
-          fi
-          # 空值处理 + 去重 + 过滤空字符串
-          TARGETS=${TARGETS:-"rpi3_64,rpi4_64"}
-          TARGETS=$(echo "$TARGETS" | tr -d ' ' | tr ',' '\n' | sort -u | tr '\n' ',' | sed 's/,$//')
-          # 转换为JSON数组（trim函数正常使用）
-          JSON=$(echo "$TARGETS" | jq -R -c 'split(",") | map(trim) | map(select(length>0))')
-          echo "matrix=$JSON" >> $GITHUB_OUTPUT
-          echo "最终编译目标: $JSON"
-          # 记录提交信息（适配 7d745f8 提交）
-          echo "COMMIT_ID=${{ github.sha }}" >> $GITHUB_ENV
-          echo "COMMIT_AUTHOR=${{ github.actor }}" >> $GITHUB_ENV
 
   build:
     needs: prepare
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-    name: Build ${{ matrix.target }} (Commit: ${{ github.sha }})
+    name: Build ${{ matrix.target }}
     strategy:
       fail-fast: false
       matrix:
         target: ${{ fromJson(needs.prepare.outputs.matrix) }}
-    permissions:
-      contents: write
-      packages: write
     steps:
-      - name: Echo target and commit info
-        run: |
-          echo "开始编译目标平台: ${{ matrix.target }}"
-          echo "触发提交ID: ${{ github.sha }}"
-          echo "提交作者: ${{ github.actor }}"
+      - name: Echo target
+        run: echo "Building for ${{ matrix.target }}"
+        #target: [generic_aarch64,generic_x86_64]
 
-      - name: Checkout main repo (完整历史)
+    #steps:
+      - name: Checkout
         uses: actions/checkout@v5
-        with:
-          token: ${{ github.token }}
-          fetch-depth: 0
-          ref: ${{ github.ref }}
 
-      # 私有仓库检出（增加重试）
       - name: Checkout private repo
         uses: actions/checkout@v5
         with:
           repository: desmond-dong/haos-cn-scripts
           token: ${{ secrets.GH_PAT }}
           path: private
-          fetch-depth: 0
-        continue-on-error: true
-        retry:
-          max_attempts: 2
-          delay_seconds: 10
 
-      - name: 安装HAOS编译必备依赖
-        run: |
-          sudo apt-get update -y && sudo apt-get upgrade -y
-          sudo apt-get install -y \
-            build-essential gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            python3 python3-pip python3-setuptools python3-wheel \
-            qemu qemu-user-static qemu-system-arm qemu-system-x86 \
-            dosfstools mtools parted squashfs-tools rsync \
-            libssl-dev libffi-dev libncurses5-dev libncursesw5-dev \
-            git curl wget unzip zip bc bison flex libelf-dev \
-            u-boot-tools swig libglib2.0-dev libfdt-dev libpixman-1-dev \
-            autoconf automake libtool pkg-config
-          # 安装Python依赖
-          pip3 install requests pycryptodome
-
-      - name: 获取HAOS版本号（Main分支）
+      - name: Run only on main
         if: github.ref_name == 'main'
         id: get_haos_version
         run: |
-          for i in {1..3}; do
-            ver=$(curl -s --retry 3 https://api.github.com/repos/home-assistant/operating-system/releases/latest | jq -r '.tag_name')
-            if [ -n "$ver" ] && [ "$ver" != "null" ]; then
-              break
-            fi
-            sleep 5
-          done
-          ver=${ver:-"12.0"}
+          ver=$(curl -s https://api.github.com/repos/home-assistant/operating-system/releases/latest | jq -r '.tag_name')
           echo "CURRENT_VERSION=${ver}" >> $GITHUB_ENV
-          echo "获取到Main分支版本: $ver"
-
-      - name: 获取HAOS版本号（Dev分支）
+  
+      - name: Run only on dev
         if: github.ref_name == 'dev'
         id: get_haos_version_dev
         run: |
-          for i in {1..3}; do
-            ver=$(curl -s --retry 3 https://version.home-assistant.io/dev.json | jq -r '.hassos.ova')
-            if [ -n "$ver" ] && [ "$ver" != "null" ]; then
-              break
-            fi
-          done
-          ver=${ver:-"12.0.dev0"}
+          ver=$(curl -s https://version.home-assistant.io/dev.json | jq -r '.hassos.ova')
+          echo "CURRENT_VERSION=${ver}"
           echo "CURRENT_VERSION=${ver}" >> $GITHUB_ENV
-          echo "获取到Dev分支版本: $ver"
-
-      - name: 初始化环境 & 释放磁盘空间
+        
+      - name: Initialization environment and Free up disk space
         run: |
           sudo timedatectl set-timezone "Asia/Shanghai"
-          # 深度清理磁盘（释放≥60GB空间）
-          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /var/lib/docker /var/cache/apt/*
-          sudo apt-get autoremove -y --purge && sudo apt-get clean -y
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
-          # 检查private目录权限
-          if [ -d "private" ]; then
-            chmod -R 755 private/
-            if [ -f "private/release_space.sh" ]; then
-              sudo private/release_space.sh || echo "自定义释放空间脚本执行失败"
-            fi
-          fi
-          df -h
+          chmod +x private/*.sh
+          sudo private/release_space.sh
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
-      - name: 克隆HAOS源码 & 配置自定义文件
+
+      - name: Clone source code and Change Settings.
         run: |
-          # 适配提交7d745f8的源码拉取逻辑
           if [ "${GITHUB_REF_NAME}" = "main" ]; then
-            git clone --depth 1 --branch main --recurse-submodules --jobs 8 https://github.com/home-assistant/operating-system.git
+            git clone https://github.com/home-assistant/operating-system.git -b main
           else
-            git clone --depth 1 --recurse-submodules --jobs 8 https://github.com/home-assistant/operating-system.git
+            git clone https://github.com/home-assistant/operating-system.git
           fi
-          # 复制自定义配置（优先使用当前提交的buildroot-external）
-          if [ -d "buildroot-external" ]; then
-            cp -rf buildroot-external/* operating-system/ || echo "自定义配置复制完成"
-          fi
-          cd operating-system || exit 1
-          git submodule update --init --recursive --jobs 8 || echo "子模块更新完成"
-          # 记录源码版本
-          echo "HAOS_SOURCE_VERSION=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
-
-      - name: 执行私有编译脚本（适配7d745f8）
+          cp -r buildroot-external operating-system
+          cd operating-system
+          git submodule update --init
+          
+      - name: Run private build script
         run: |
-          if [ -d "private" ]; then
-            chmod +x private/haos.sh
-            # 传递提交信息给私有脚本
-            MATRIX_TARGET=${{ matrix.target }} \
-            COMMIT_ID=${{ github.sha }} \
-            HAOS_VERSION=${{ env.CURRENT_VERSION }} \
-            private/haos.sh
-          else
-            echo "private目录不存在，跳过私有脚本"
-          fi
+          chmod +x private/*.sh
+          private/haos.sh
         env:
+          MATRIX_TARGET: ${{matrix.target}}
           RAUC_CERTIFICATE: ${{ secrets.RAUC_CERTIFICATE }}
           RAUC_PRIVATE_KEY: ${{ secrets.RAUC_PRIVATE_KEY }}
-        continue-on-error: true
 
-      - name: 登录Docker Hub
-        uses: docker/login-action@v3
+ 
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-        continue-on-error: true
 
-      - name: 开始编译HAOS镜像
+      - name: Build 
         shell: 'script -q -e -c "bash {0}"'
         id: build
         run: |
-          sleep $((RANDOM % 300))    
-          cd operating-system || { echo "HAOS目录不存在"; exit 1; }
-          # 增加编译缓存（加速重复构建）
-          mkdir -p ~/.cache/haos-build
-          export BUILDROOT_CACHE_DIR=~/.cache/haos-build
-          # 执行编译并记录日志
-          echo "开始编译 ${{ matrix.target }} (HAOS版本: ${{ env.CURRENT_VERSION }})"
-          scripts/enter.sh make ${{ matrix.target }} 2>&1 | tee build-${{ matrix.target }}.log
-          # 检查编译产物
-          if [ -d "output/images" ] && ls output/images/haos_* 1> /dev/null 2>&1; then
-            echo "build_success=true" >> $GITHUB_OUTPUT
-            ls -la output/images/
-          else
-            echo "build_success=false" >> $GITHUB_OUTPUT
-            exit 1
-          fi
+          sleep $((RANDOM % 600))    
+          cd operating-system
+          scripts/enter.sh make ${{matrix.target}}
 
-      - name: 设置Release标签和描述
-        if: steps.build.outputs.build_success == 'true'
+          
+
+      - name: Set tag and body for release
+        if: github.ref_name == 'main'
         run: |
-          if [ "${{ github.ref_name }}" = "main" ]; then
-            RELEASE_TAG="${{ env.CURRENT_VERSION }}-${{ github.sha::8 }}"
-            RELEASE_BODY="✅ 编译版本: ${RELEASE_TAG}
-✅ 触发提交: ${{ github.sha }}
-✅ 编译目标: ${{ matrix.target }}
-✅ 适配提交: 7d745f8
-为中国地区专门加速的Home Assistant OS，公众号：老王杂谈说"
-          else
-            RELEASE_TAG="dev-${{ env.CURRENT_VERSION }}-${{ github.sha::8 }}"
-            RELEASE_BODY="⚠️ 开发版请勿用于生产环境
-⚠️ 编译版本: ${RELEASE_TAG}
-⚠️ 触发提交: ${{ github.sha }}
-⚠️ 编译目标: ${{ matrix.target }}"
-          fi
-          echo "RELEASE_TAG=${RELEASE_TAG}" >> $GITHUB_ENV
-          echo "RELEASE_BODY=${RELEASE_BODY}" >> $GITHUB_ENV
+          echo "RELEASE_TAG=${CURRENT_VERSION}" >> $GITHUB_ENV
+          echo "RELEASE_BODY=为中国地区专门加速的Home Assistant OS，不修改任何系统内的其它任何信息，所有的修改都以加速为目的。公众号：老王杂谈说，欢迎关注" >> $GITHUB_ENV
 
-      - name: 上传镜像到GitHub Release
-        if: steps.build.outputs.build_success == 'true'
+      - name: Set tag and body for dev release
+        if: github.ref_name != 'main'
+        run: |
+          echo "RELEASE_TAG=dev-${CURRENT_VERSION}" >> $GITHUB_ENV
+          echo "RELEASE_BODY=此为开发版，请不要当正式版使用" >> $GITHUB_ENV
+
+      - name: Upload images to release
         id: upload-release
         uses: svenstaro/upload-release-action@v2
         with:
-          repo_token: ${{ secrets.UPLOAD_TOKEN || github.token }}
+          repo_token: ${{ secrets.UPLOAD_TOKEN }}
           file: operating-system/output/images/haos_*
           tag: ${{ env.RELEASE_TAG }}
           overwrite: true
           file_glob: true
           body: ${{ env.RELEASE_BODY }}
           prerelease: ${{ github.ref != 'refs/heads/main' }}
-
-      - name: 上传编译日志和产物清单
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-${{ matrix.target }}-logs-${{ github.sha::8 }}
-          path: |
-            operating-system/build-${{ matrix.target }}.log
-            operating-system/output/images/*.txt
-          retention-days: 14
